@@ -21,6 +21,7 @@ The script aims to produce a single output file with a smooth visual/audio trans
 - Automatic probing of the first input with `ffprobe` to reuse resolution, fps, pixel format and audio settings when reasonable.
 - Optional NVIDIA hardware acceleration (if `ffmpeg` build and system drivers support it); safe software fallback if drivers/builds are missing or fail.
 - Preserves 10-bit color where possible (script handles `yuv420p10le` and maps formats as required).
+ - New: folder-mode (`-InputFolder`) — merge all video files from a directory into a single output using chained `xfade`+`acrossfade` transitions.
 
 ---
 
@@ -44,6 +45,20 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\cvwe.ps1 `
   -Input2 'C:\path\to\input2.mp4' `
   -Output 'C:\path\to\output.mp4'
 ```
+
+Folder mode (merge all videos from a directory):
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\cvwe.ps1 `
+	-InputFolder 'C:\path\to\videos' `
+	-Output 'C:\path\to\output.mp4'
+```
+
+Notes about folder mode:
+- The script scans `-InputFolder` and selects files with common video extensions (mkv, mp4, avi, mov, webm, m4v, ts, mpg, mpeg, flv, wmv).
+- Files are sorted by name and chained in that order; each adjacent pair receives an `xfade`+`acrossfade` at a computed offset near the end of the preceding clip.
+- The script excludes the output file (if present in the input folder) to avoid re-processing previous runs.
+- If an input file lacks audio, the script generates silence of the same duration so `acrossfade` can proceed smoothly.
 
 The script accepts additional optional parameters (check the script header for `param()` usage). Common parameters you may see or tweak inside the script:
 
@@ -85,8 +100,12 @@ After running, the script prints status messages about planned decode mode (hw/s
 
 - If you see a message like "nvcuda.dll not found — NVidia drivers not available", the script is correctly falling back to software modes. Install NVIDIA drivers and ensure `nvcuda.dll` exists (and `nvidia-smi` is in PATH) to enable GPU mode.
 - Some ffmpeg builds have limited format conversion support between GPU-backed pixel formats and CPU filter formats (10-bit pipelines can fail with a filter error). In such cases the script will detect the failure and automatically re-run with software decode.
+ - Some ffmpeg builds have limited format conversion support between GPU-backed pixel formats and CPU filter formats (10-bit pipelines can fail with a filter error). In such cases the script will detect the failure and automatically re-run with software decode. This fallback behavior also applies in folder mode.
 - If you need to force software-only processing, run the script on a machine without CUDA drivers or edit `cvwe.ps1` to set the NVidia flag off.
 - The script is conservative about preserving color depth and will try to keep 10-bit where the pipeline allows. If your target player or web platform needs 8-bit, transcode the output afterwards or modify the `-pix_fmt` option in the script.
+
+Additional troubleshooting for folder mode:
+- If your output file already exists in the input directory, either remove/rename it before running or specify an output path outside the input folder; the script will also try to exclude the output file automatically.
 
 ---
 
