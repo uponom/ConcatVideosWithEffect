@@ -18,11 +18,14 @@
 
 [CmdletBinding()]
 param(
-  [Parameter(Mandatory=$true)]
+  [Parameter(Mandatory=$true, ParameterSetName='TwoFiles')]
   [string]$Input1,
 
-  [Parameter(Mandatory=$true)]
+  [Parameter(Mandatory=$true, ParameterSetName='TwoFiles')]
   [string]$Input2,
+
+  [Parameter(Mandatory=$true, ParameterSetName='Folder')]
+  [string]$InputFolder,
 
   [Parameter(Mandatory=$true)]
   [string]$Output,
@@ -175,202 +178,153 @@ function SafeAddRange([System.Collections.Generic.List[string]]$list, [object]$i
   }
 }
 
-# --- Read parameters from the first file ---
-$meta1 = Get-FFProbeJson $Input1
+# --- Prepare input list (either two-file mode or folder mode) ---
+if ($PSCmdlet.ParameterSetName -eq 'Folder') {
+  $videoExts = @('mkv','mp4','avi','mov','webm','m4v','ts','mpg','mpeg','flv','wmv')
+  $outFull = $null
+  try { $outFull = [IO.Path]::GetFullPath($Output) } catch { $outFull = $Output }
+  $files = Get-ChildItem -Path $InputFolder -File -ErrorAction Stop |
+           Where-Object { ($videoExts -contains ($_.Extension.TrimStart('.').ToLower())) -and ($_.FullName -ne $outFull) } |
+           Sort-Object Name |
+           ForEach-Object { $_.FullName }
+  if ($files.Count -lt 2) { throw "InputFolder must contain at least two video files." }
+} else {
+  $files = @($Input1, $Input2)
+}
 
- $vid1 = $meta1.streams | Where-Object { $_.codec_type -eq "video" } | Select-Object -First 1
-if (-not $vid1) { throw "No video stream found in $Input1." }
+# Probe all inputs and extract primary video/audio streams
+$metas = @()
+foreach ($f in $files) { $metas += Get-FFProbeJson $f }
+$vids = $metas | ForEach-Object { $_.streams | Where-Object { $_.codec_type -eq 'video' } | Select-Object -First 1 }
+foreach ($i in 0..($vids.Count-1)) { if (-not $vids[$i]) { throw "No video stream found in $($files[$i])." } }
 
-$aud1 = $meta1.streams | Where-Object { $_.codec_type -eq "audio" } | Select-Object -First 1
-# audio may be absent — output will be video-only
-
-# Probe second input as well (used for input-specific decoder decision)
-$meta2 = Get-FFProbeJson $Input2
-$vid2 = $meta2.streams | Where-Object { $_.codec_type -eq "video" } | Select-Object -First 1
-if (-not $vid2) { throw "No video stream found in $Input2." }
+# First file determines output parameters
+$meta1 = $metas[0]
+$vid1 = $vids[0]
+$aud1 = $meta1.streams | Where-Object { $_.codec_type -eq 'audio' } | Select-Object -First 1
 
 $width  = [int]$vid1.width
 $height = [int]$vid1.height
 
-# FPS: prefer avg_frame_rate, otherwise r_frame_rate (needed for frame-accurate offset)
+# FPS from first file
 $fpsVal = Parse-FractionToDouble ($vid1.avg_frame_rate)
 if (-not $fpsVal -or $fpsVal -le 0) { $fpsVal = Parse-FractionToDouble ($vid1.r_frame_rate) }
 if (-not $fpsVal -or $fpsVal -le 0) { $fpsVal = 30.0 }
 $fps = [math]::Round($fpsVal, 3)
 $fpsExact = $fpsVal
 
-# --- Duration of the first file (seconds) and automatic transition start offset ---
-$duration1 = $null
-if ($meta1.format -and $meta1.format.PSObject.Properties.Name -contains 'duration' -and $meta1.format.duration) {
-  $duration1 = [double]::Parse($meta1.format.duration, [System.Globalization.CultureInfo]::InvariantCulture)
-} elseif ($vid1.PSObject.Properties.Name -contains 'duration' -and $vid1.duration) {
-  $duration1 = [double]::Parse($vid1.duration, [System.Globalization.CultureInfo]::InvariantCulture)
+# Durations for chaining offsets
+$durations = @()
+foreach ($idx in 0..($metas.Count-1)) {
+  $m = $metas[$idx]
+  $v = $m.streams | Where-Object { $_.codec_type -eq 'video' } | Select-Object -First 1
+  $d = $null
+  if ($m.format -and $m.format.PSObject.Properties.Name -contains 'duration' -and $m.format.duration) {
+    $d = [double]::Parse($m.format.duration, [System.Globalization.CultureInfo]::InvariantCulture)
+  } elseif ($v.PSObject.Properties.Name -contains 'duration' -and $v.duration) {
+    $d = [double]::Parse($v.duration, [System.Globalization.CultureInfo]::InvariantCulture)
+  }
+  if ($null -eq $d) { Write-Host "Warning: could not determine duration of $($files[$idx]); assuming 0." -ForegroundColor Yellow; $d = 0 }
+  $durations += $d
 }
 
-if ($null -ne $duration1) {
-  # Compute offset in frame units to avoid dropping/duplicating frames due to floating point rounding.
-  $frameCount1 = [int][math]::Round($duration1 * $fpsExact)
-  $transitionFrames = [int][math]::Round([double]$TransitionDuration * $fpsExact)
-  $offsetFrames = [int][math]::Max(0, ($frameCount1 - $transitionFrames))
-  $autoOffset = [double]$offsetFrames / $fpsExact
-  $autoOffset = [double]([math]::Round($autoOffset, 6))
-  Write-Host "Auto-computed TransitionOffset = $autoOffset (frames: $offsetFrames of $frameCount1; duration=$duration1, transition duration=$TransitionDuration)" -ForegroundColor Cyan
-  $TransitionOffset = $autoOffset
-} else {
-  Write-Host "Warning: could not determine duration of $Input1; using TransitionOffset=$TransitionOffset" -ForegroundColor Yellow
+# Compute per-transition offsets so each transition starts near end of the current accumulated stream
+$offsets = @()
+if ($durations.Count -ge 2) {
+  $cum = $durations[0]
+  for ($i=0; $i -lt ($durations.Count - 1); $i++) {
+    $off = [double]::Max(0.0, ($cum - $TransitionDuration))
+    $offsets += [double]([math]::Round($off, 6))
+    # update cumulative length after applying transition overlap
+    $cum = $cum + $durations[$i+1] - $TransitionDuration
+  }
 }
 
+if ($vid1.PSObject.Properties.Name -contains 'pix_fmt' -and $vid1.pix_fmt) { $pixFmt = [string]$vid1.pix_fmt } else { $pixFmt = 'yuv420p' }
+if ($UseNvidia -and $pixFmt -eq 'yuv420p10le') { $outPixFmt = 'p010le' } else { $outPixFmt = $pixFmt }
+if ($outPixFmt -eq 'p010le') { $filterPixFmt = 'yuv420p10le' } else { $filterPixFmt = $pixFmt }
 
-if ($vid1.PSObject.Properties.Name -contains 'pix_fmt' -and $vid1.pix_fmt) { 
-  $pixFmt = [string]$vid1.pix_fmt 
-} else { 
-  $pixFmt = "yuv420p" 
-}
+# Video encoder selection preserved (prefer NVENC when available)
+if ($UseNvidia) { $videoEnc = 'hevc_nvenc' } else { $videoEnc = 'libx265' }
+if (-not $videoEnc) { throw "Unknown encoder mapping for codec_name='$($vid1.codec_name)'." }
 
-# When using NVENC, map 10-bit pixel format to the encoder-expected format
-if ($UseNvidia -and $pixFmt -eq 'yuv420p10le') {
-  $outPixFmt = 'p010le'
-} else {
-  $outPixFmt = $pixFmt
-}
-
-# Pixel format used inside CPU filter graph: use standard yuv420p10le for 10-bit
-if ($outPixFmt -eq 'p010le') {
-  $filterPixFmt = 'yuv420p10le'
-} else {
-  $filterPixFmt = $pixFmt
-}
-
-$videoCodec = [string]$vid1.codec_name
-# Force H.265 output per user request: prefer NVENC when available, otherwise libx265
-if ($UseNvidia) {
-  $videoEnc = 'hevc_nvenc'
-} else {
-  $videoEnc = 'libx265'
-}
-if (-not $videoEnc) {
-  throw "Unknown encoder mapping for codec_name='$videoCodec'. Add mapping in Pick-VideoEncoder."
-}
-
-# Bitrate/quality: if the video stream has a bit_rate — use it as target -b:v.
-# Note: this does not guarantee identical mode (CBR/VBR), but approximates it.
-$videoBitrate = $null
-if ($vid1.PSObject.Properties.Name -contains "bit_rate" -and $vid1.bit_rate) {
-  $videoBitrate = [int64]$vid1.bit_rate
-}
-
-# Profile/level (apply for H.264/H.265, but values can be strings)
-if ($vid1.PSObject.Properties.Name -contains 'profile' -and $vid1.profile) { 
-  $profile = [string]$vid1.profile 
-} else { 
-  $profile = $null 
-}
-
-if ($vid1.PSObject.Properties.Name -contains 'level' -and $vid1.level) { 
-  $level = [string]$vid1.level 
-} else { 
-  $level = $null 
-}
-
-# Color metadata (if present)
-if ($vid1.PSObject.Properties.Name -contains 'color_primaries' -and $vid1.color_primaries) { 
-  $colorPrimaries = [string]$vid1.color_primaries 
-} else { 
-  $colorPrimaries = $null 
-}
-
-if ($vid1.PSObject.Properties.Name -contains 'color_transfer' -and $vid1.color_transfer) { 
-  $colorTrc = [string]$vid1.color_transfer 
-} else { 
-  $colorTrc = $null 
-}
-
-if ($vid1.PSObject.Properties.Name -contains 'colorspace' -and $vid1.colorspace) { 
-  $colorspace = [string]$vid1.colorspace 
-} else { 
-  $colorspace = $null 
-}
-
-# --- Audio parameters ---
-$audioEnc = $null
-$audioCodec = $null
-$audioBitrate = $null
-$audioRate = $null
-$audioChannels = $null
-
+# Audio params from first file
+$audioEnc = $null; $audioCodec = $null; $audioBitrate = $null; $audioRate = $null; $audioChannels = $null
 if ($aud1) {
   $audioCodec = [string]$aud1.codec_name
   $audioEnc = Pick-AudioEncoder $audioCodec
-  if (-not $audioEnc) {
-    throw "Unknown audio encoder mapping for codec_name='$audioCodec'. Add mapping in Pick-AudioEncoder."
-  }
-
-  if ($aud1.PSObject.Properties.Name -contains "bit_rate" -and $aud1.bit_rate) {
-    $audioBitrate = [int64]$aud1.bit_rate
-  } else {
-    $audioBitrate = [int64]$DefaultAudioBitrate
-  }
-
-  if ($aud1.PSObject.Properties.Name -contains "sample_rate" -and $aud1.sample_rate) {
-    $audioRate = [int]$aud1.sample_rate
-  } else {
-    $audioRate = 48000
-  }
-
-  if ($aud1.PSObject.Properties.Name -contains "channels" -and $aud1.channels) {
-    $audioChannels = [int]$aud1.channels
-  } else {
-    $audioChannels = 2
-  }
+  if (-not $audioEnc) { throw "Unknown audio encoder mapping for codec_name='$audioCodec'." }
+  if ($aud1.PSObject.Properties.Name -contains 'bit_rate' -and $aud1.bit_rate) { $audioBitrate = [int64]$aud1.bit_rate } else { $audioBitrate = [int64]$DefaultAudioBitrate }
+  if ($aud1.PSObject.Properties.Name -contains 'sample_rate' -and $aud1.sample_rate) { $audioRate = [int]$aud1.sample_rate } else { $audioRate = 48000 }
+  if ($aud1.PSObject.Properties.Name -contains 'channels' -and $aud1.channels) { $audioChannels = [int]$aud1.channels } else { $audioChannels = 2 }
 }
 
-# --- Build filter_complex ---
-# Normalize both inputs to match the first input's parameters:
-# - scale to (width,height)
-# - fps to fps
-# - format to pixFmt
-# For audio, normalize sample_rate/channel_layout so acrossfade behaves predictably.
-$filterParts = New-Object System.Collections.Generic.List[string]
+function Build-FilterComplex([bool]$useHwDownload) {
+  $parts = New-Object System.Collections.Generic.List[string]
+  $scaleFps = "scale=$($width):$($height),fps=$($fps.ToString([System.Globalization.CultureInfo]::InvariantCulture))"
 
-$scaleFps = "scale=$($width):$($height),fps=$($fps.ToString([System.Globalization.CultureInfo]::InvariantCulture))"
-if ($UseNvidia) {
-  # Choose appropriate hwdownload format per input based on source pix_fmt (10-bit -> p010le, else nv12)
-  $inPix0 = if ($vid1.PSObject.Properties.Name -contains 'pix_fmt' -and $vid1.pix_fmt) { [string]$vid1.pix_fmt } else { 'yuv420p' }
-  $inPix1 = if ($vid2.PSObject.Properties.Name -contains 'pix_fmt' -and $vid2.pix_fmt) { [string]$vid2.pix_fmt } else { 'yuv420p' }
-
-  $dl0 = if ($inPix0 -match '10le') { 'p010le' } else { 'nv12' }
-  $dl1 = if ($inPix1 -match '10le') { 'p010le' } else { 'nv12' }
-
-  $filterParts.Add("[0:v]hwdownload,format=$dl0,$scaleFps,format=$($filterPixFmt)[v0]")
-  $filterParts.Add("[1:v]hwdownload,format=$dl1,$scaleFps,format=$($filterPixFmt)[v1]")
-} else {
-  $filterParts.Add("[0:v]$scaleFps,format=$($filterPixFmt)[v0]")
-  $filterParts.Add("[1:v]$scaleFps,format=$($filterPixFmt)[v1]")
-}
-$filterParts.Add("[v0][v1]xfade=transition=$($Transition):duration=$($TransitionDuration.ToString([System.Globalization.CultureInfo]::InvariantCulture)):offset=$($TransitionOffset.ToString([System.Globalization.CultureInfo]::InvariantCulture))[v]")
-
-if ($aud1) {
-  # Channels: 1 -> mono, 2 -> stereo, otherwise leave unconstrained (but attempt conversion)
-  $layout = switch ($audioChannels) {
-    1 { "mono" }
-    2 { "stereo" }
-    default { $null }
+  for ($i=0; $i -lt $files.Count; $i++) {
+    $v = $vids[$i]
+    if ($useHwDownload -and $UseNvidia) {
+      $inPix = if ($v.PSObject.Properties.Name -contains 'pix_fmt' -and $v.pix_fmt) { [string]$v.pix_fmt } else { 'yuv420p' }
+      $dl = if ($inPix -match '10le') { 'p010le' } else { 'nv12' }
+      $parts.Add("[$($i):v]hwdownload,format=$dl,$scaleFps,format=$($filterPixFmt)[v$($i)]")
+    } else {
+      $parts.Add("[$($i):v]$scaleFps,format=$($filterPixFmt)[v$($i)]")
+    }
   }
 
-  if ($layout) {
-    $filterParts.Add("[0:a]aformat=sample_rates=$($audioRate):channel_layouts=$($layout)[a0]")
-    $filterParts.Add("[1:a]aformat=sample_rates=$($audioRate):channel_layouts=$($layout)[a1]")
-  } else {
-    $filterParts.Add("[0:a]aresample=$($audioRate)[a0]")
-    $filterParts.Add("[1:a]aresample=$($audioRate)[a1]")
+  # Video xfade chaining
+  for ($i=0; $i -lt ($files.Count - 1); $i++) {
+    $first = if ($i -eq 0) { "[v0]" } else { "[vx$i]" }
+    $second = "[v$($i+1)]"
+    $isLast = ($i -eq $files.Count - 2)
+    $out = if ($isLast) { "[v]" } else { "[vx$($i+1)]" }
+    $offsetVal = $offsets[$i]
+    $parts.Add($first + $second + "xfade=transition=$($Transition):duration=$($TransitionDuration.ToString([System.Globalization.CultureInfo]::InvariantCulture)):offset=$($offsetVal.ToString([System.Globalization.CultureInfo]::InvariantCulture))" + $out)
   }
 
-  $filterParts.Add("[a0][a1]acrossfade=d=$($TransitionDuration.ToString([System.Globalization.CultureInfo]::InvariantCulture))[a]")
+  # Audio acrossfade chaining (if first file has audio). For missing audio, generate silence.
+  if ($aud1) {
+    $layout = switch ($audioChannels) { 1 { 'mono' } 2 { 'stereo' } default { $null } }
+    for ($i=0; $i -lt $files.Count; $i++) {
+      $m = $metas[$i]
+      $hasA = $m.streams | Where-Object { $_.codec_type -eq 'audio' } | Select-Object -First 1
+      if ($hasA) {
+        if ($layout) { $parts.Add("[$($i):a]aformat=sample_rates=$($audioRate):channel_layouts=$($layout)[a$($i)]") } else { $parts.Add("[$($i):a]aresample=$($audioRate)[a$($i)]") }
+      } else {
+        $d = $durations[$i].ToString([System.Globalization.CultureInfo]::InvariantCulture)
+        if ($layout) { $parts.Add("anullsrc=channel_layouts=$($layout):sample_rates=$($audioRate),atrim=duration=$d[a$($i)]") } else { $parts.Add("anullsrc=sample_rates=$($audioRate),atrim=duration=$d[a$($i)]") }
+      }
+    }
+
+    for ($i=0; $i -lt ($files.Count - 1); $i++) {
+      $first = if ($i -eq 0) { "[a0]" } else { "[ax$($i)]" }
+      $second = "[a$($i+1)]"
+      $isLast = ($i -eq $files.Count - 2)
+      $out = if ($isLast) { "[a]" } else { "[ax$($i+1)]" }
+      $parts.Add($first + $second + "acrossfade=d=$($TransitionDuration.ToString([System.Globalization.CultureInfo]::InvariantCulture))" + $out)
+    }
+  }
+
+  return ($parts -join "; ")
 }
 
-$filterComplex = ($filterParts -join "; ")
+# Build hw filter_complex by default (if NVidia requested)
+$filterComplex = Build-FilterComplex $true
 
-# --- Video encoding arguments ---
+# Bitrate/quality and stream metadata from first file (used for encoder args)
+$videoBitrate = $null
+if ($vid1.PSObject.Properties.Name -contains "bit_rate" -and $vid1.bit_rate) { $videoBitrate = [int64]$vid1.bit_rate }
+
+# Profile/level (apply for H.264/H.265, but values can be strings)
+if ($vid1.PSObject.Properties.Name -contains 'profile' -and $vid1.profile) { $profile = [string]$vid1.profile } else { $profile = $null }
+if ($vid1.PSObject.Properties.Name -contains 'level' -and $vid1.level) { $level = [string]$vid1.level } else { $level = $null }
+
+# Color metadata (if present)
+if ($vid1.PSObject.Properties.Name -contains 'color_primaries' -and $vid1.color_primaries) { $colorPrimaries = [string]$vid1.color_primaries } else { $colorPrimaries = $null }
+if ($vid1.PSObject.Properties.Name -contains 'color_transfer' -and $vid1.color_transfer) { $colorTrc = [string]$vid1.color_transfer } else { $colorTrc = $null }
+if ($vid1.PSObject.Properties.Name -contains 'colorspace' -and $vid1.colorspace) { $colorspace = [string]$vid1.colorspace } else { $colorspace = $null }
 $videoArgs = New-Object System.Collections.Generic.List[string]
 SafeAddRange $videoArgs @("-c:v", $videoEnc) "videoArgs: -c:v"
 
@@ -457,25 +411,28 @@ if ($UseNvidia) {
   $decoderMap = @{ 'h264' = 'h264_cuvid'; 'hevc' = 'hevc_cuvid'; 'mpeg2' = 'mpeg2_cuvid'; 'vc1' = 'vc1_cuvid' }
 
   $inputArgs = @()
-  foreach ($pair in @(@{File=$Input1; Vid=$vid1}, @{File=$Input2; Vid=$vid2})) {
+  for ($i=0; $i -lt $files.Count; $i++) {
     $decOpt = $null
-    if ($pair.Vid -and $pair.Vid.codec_name) {
-      $c = [string]$pair.Vid.codec_name
+    $v = $vids[$i]
+    if ($v -and $v.codec_name) {
+      $c = [string]$v.codec_name
       if ($decoderMap.ContainsKey($c)) {
         $cand = $decoderMap[$c]
         if ($nvidia.Decoders -match $cand) { $decOpt = $cand }
       }
     }
     if ($decOpt) {
-      $inputArgs += @("-c:v", $decOpt, "-i", $pair.File)
+      $inputArgs += @("-c:v", $decOpt, "-i", $files[$i])
     } else {
-      $inputArgs += @("-i", $pair.File)
+      $inputArgs += @("-i", $files[$i])
     }
   }
 
   SafeAddRange $ffArgs $inputArgs "ffArgs: inputs with hwdec"
 } else {
-  SafeAddRange $ffArgs @("-y", "-i", $Input1, "-i", $Input2) "ffArgs: inputs"
+  $inputArgs = @()
+  for ($i=0; $i -lt $files.Count; $i++) { $inputArgs += @("-i", $files[$i]) }
+  SafeAddRange $ffArgs $inputArgs "ffArgs: inputs"
 }
 SafeAddRange $ffArgs @("-filter_complex", $filterComplex) "ffArgs: filter_complex"
 SafeAddRange $ffArgs $mapArgs "ffArgs: mapArgs"
@@ -507,30 +464,15 @@ if ($LASTEXITCODE -eq 0) {
 if ($LASTEXITCODE -ne 0 -and $UseNvidia) {
   Write-Host "Hardware decode path failed (ffmpeg exit $LASTEXITCODE). Retrying with software decode and NVENC encode..." -ForegroundColor Yellow
 
-  # Rebuild filter_complex for software decode (no hwdownload)
-  $filterParts2 = New-Object System.Collections.Generic.List[string]
-  $scaleFps = "scale=$($width):$($height),fps=$($fps.ToString([System.Globalization.CultureInfo]::InvariantCulture))"
-  $filterParts2.Add("[0:v]$scaleFps,format=$($filterPixFmt)[v0]")
-  $filterParts2.Add("[1:v]$scaleFps,format=$($filterPixFmt)[v1]")
-  $filterParts2.Add("[v0][v1]xfade=transition=$($Transition):duration=$($TransitionDuration.ToString([System.Globalization.CultureInfo]::InvariantCulture)):offset=$($TransitionOffset.ToString([System.Globalization.CultureInfo]::InvariantCulture))[v]")
-
-  if ($aud1) {
-    $layout = switch ($audioChannels) {1 { "mono" } 2 { "stereo" } default { $null }}
-    if ($layout) {
-      $filterParts2.Add("[0:a]aformat=sample_rates=$($audioRate):channel_layouts=$($layout)[a0]")
-      $filterParts2.Add("[1:a]aformat=sample_rates=$($audioRate):channel_layouts=$($layout)[a1]")
-    } else {
-      $filterParts2.Add("[0:a]aresample=$($audioRate)[a0]")
-      $filterParts2.Add("[1:a]aresample=$($audioRate)[a1]")
-    }
-    $filterParts2.Add("[a0][a1]acrossfade=d=$($TransitionDuration.ToString([System.Globalization.CultureInfo]::InvariantCulture))[a]")
-  }
-
-  $filterComplex2 = ($filterParts2 -join "; ")
+  # Rebuild filter_complex for software decode (no hwdownload) using the same builder
+  $filterComplex2 = Build-FilterComplex $false
 
   # Build ffmpeg args for software-decode + (prefer) NVENC encode
   $ffArgs2 = New-Object System.Collections.Generic.List[string]
-  SafeAddRange $ffArgs2 @("-y", "-i", $Input1, "-i", $Input2) "ffArgs2: inputs"
+  SafeAddRange $ffArgs2 @("-y") "ffArgs2: overwrite"
+  $inputArgs2 = @()
+  for ($i=0; $i -lt $files.Count; $i++) { $inputArgs2 += @("-i", $files[$i]) }
+  SafeAddRange $ffArgs2 $inputArgs2 "ffArgs2: inputs"
   SafeAddRange $ffArgs2 @("-filter_complex", $filterComplex2) "ffArgs2: filter_complex"
   SafeAddRange $ffArgs2 $mapArgs "ffArgs2: mapArgs"
 
